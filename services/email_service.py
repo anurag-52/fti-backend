@@ -1,38 +1,43 @@
-import smtplib
-import logging
 import os
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from datetime import date
-from typing import List, Dict, Optional
-from sqlalchemy.orm import Session
-from database import User, Signal, TradeConfirmation, Position, EmailLog, BSEStock, OHLCV
+import logging
+import urllib.request
+import urllib.error
+import json
 
 logger = logging.getLogger(__name__)
 
-SMTP_HOST     = os.getenv("SMTP_HOST", "smtp-relay.brevo.com")
-SMTP_PORT     = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER     = os.getenv("SMTP_USER", "")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
-FROM_EMAIL    = os.getenv("FROM_EMAIL", "noreply@ftitrading.com")
+BREVO_API_KEY = os.getenv("BREVO_API_KEY", "")
+FROM_EMAIL    = os.getenv("FROM_EMAIL", "freedomtraderindia@gmail.com")
 APP_URL       = os.getenv("APP_URL", "http://localhost:8000")
 
 def send_email(to_email: str, subject: str, html_body: str) -> bool:
-    if not SMTP_USER or not SMTP_PASSWORD:
-        logger.warning("SMTP not configured")
+    if not BREVO_API_KEY:
+        logger.warning("BREVO_API_KEY not set")
         return False
     try:
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = subject
-        msg["From"] = FROM_EMAIL
-        msg["To"] = to_email
-        msg.attach(MIMEText(html_body, "html"))
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-            server.starttls()
-            server.login(SMTP_USER, SMTP_PASSWORD)
-            server.sendmail(FROM_EMAIL, to_email, msg.as_string())
-        logger.info(f"Email sent to {to_email}: {subject}")
-        return True
+        payload = json.dumps({
+            "sender": {"name": "FTI Trading", "email": FROM_EMAIL},
+            "to": [{"email": to_email}],
+            "subject": subject,
+            "htmlContent": html_body
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            "https://api.brevo.com/v3/smtp/email",
+            data=payload,
+            headers={
+                "api-key": BREVO_API_KEY,
+                "Content-Type": "application/json",
+                "Accept": "application/json"
+            },
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read())
+            logger.info(f"Email sent to {to_email} | messageId={result.get('messageId')}")
+            return True
+    except urllib.error.HTTPError as e:
+        logger.error(f"Brevo API error {e.code}: {e.read().decode()}")
+        return False
     except Exception as e:
         logger.error(f"Email failed to {to_email}: {e}")
         return False
