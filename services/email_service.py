@@ -1,52 +1,42 @@
-"""
-Email Service
-5 PM Confirmation Email + 6 PM Recommendation Email
-Uses SendGrid (free tier) or SMTP
-"""
-
-import smtplib
-import logging
 import os
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from datetime import date
-from typing import List, Dict, Optional
-from sqlalchemy.orm import Session
-
-from database import User, Signal, TradeConfirmation, Position, EmailLog, BSEStock, OHLCV
+import logging
+import urllib.request
+import urllib.error
+import json
 
 logger = logging.getLogger(__name__)
 
-SMTP_HOST     = os.getenv("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT     = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER     = os.getenv("SMTP_USER", "")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
-FROM_EMAIL    = os.getenv("FROM_EMAIL", "signals@ftitrading.com")
-APP_URL       = os.getenv("APP_URL", "http://localhost:8000")
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
+FROM_EMAIL = os.getenv("FROM_EMAIL", "onboarding@resend.dev")
+APP_URL = os.getenv("APP_URL", "http://localhost:8000")
 
 def send_email(to_email: str, subject: str, html_body: str) -> bool:
-    """Send HTML email via SMTP"""
-    if not SMTP_USER or not SMTP_PASSWORD:
-        logger.warning("SMTP not configured — email not sent")
+    if not RESEND_API_KEY:
+        logger.warning("RESEND_API_KEY not set")
         return False
     try:
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = subject
-        msg["From"]    = FROM_EMAIL
-        msg["To"]      = to_email
-        msg.attach(MIMEText(html_body, "html"))
-
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-            server.starttls()
-            server.login(SMTP_USER, SMTP_PASSWORD)
-            server.sendmail(FROM_EMAIL, to_email, msg.as_string())
-        logger.info(f"Email sent to {to_email}: {subject}")
-        return True
-    except Exception as e:
-        logger.error(f"Email failed to {to_email}: {e}")
+        payload = json.dumps({
+            "from": f"FTI Trading <{FROM_EMAIL}>",
+            "to": [to_email],
+            "subject": subject,
+            "html": html_body
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            "https://api.resend.com/emails",
+            data=payload,
+            headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read())
+            logger.info(f"Email sent to {to_email} | id={result.get('id')}")
+            return True
+    except urllib.error.HTTPError as e:
+        logger.error(f"Resend error {e.code}: {e.read().decode()}")
         return False
-
-# ─── EMAIL TEMPLATES ─────────────────────────────────────────────────────────
+    except Exception as e:
+        logger.error(f"Email failed: {e}")
+        return False
 
 EMAIL_STYLE = """
 <style>
