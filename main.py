@@ -26,6 +26,23 @@ async def lifespan(app: FastAPI):
     # Create all DB tables on startup
     Base.metadata.create_all(bind=engine)
     logger.info("Database tables created/verified")
+    # Seed admin user on startup
+    from database import SessionLocal, User
+    from auth import hash_password
+    try:
+        db = SessionLocal()
+        if not db.query(User).filter(User.email == "admin@ftitrading.com").first():
+            db.add(User(name="Super Admin", email="admin@ftitrading.com",
+                        hashed_password=hash_password("Admin2026"),
+                        is_admin=True, is_active=True, onboarding_done=True))
+            db.commit()
+            logger.info("Admin user created")
+        else:
+            logger.info("Admin user already exists")
+        db.close()
+    except Exception as e:
+        logger.info(f"Seed error: {e}")
+
 
     # Schedule daily jobs (IST timezone)
     scheduler.add_job(run_daily_jobs, "cron", hour=16, minute=30, id="daily_data_pull")
