@@ -3,7 +3,7 @@ All API Routers — FTI Trading App
 """
 
 # ─── IMPORTS ─────────────────────────────────────────────────────────────────
-from fastapi import APIRouter, Depends, HTTPException, Body
+from fastapi import APIRouter, Depends, HTTPException, Body, BackgroundTasks
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, EmailStr
@@ -35,9 +35,11 @@ class UserCreate(BaseModel):
 
 class UserUpdate(BaseModel):
     name: Optional[str] = None
+    email: Optional[str] = None
     mobile: Optional[str] = None
     investment_amount: Optional[float] = None
     is_active: Optional[bool] = None
+    password: Optional[str] = None
 
 class PasswordChange(BaseModel):
     current_password: str
@@ -147,7 +149,7 @@ def list_users(db: Session = Depends(get_db), admin: User = Depends(get_current_
     return result
 
 @admin_router.post("/users")
-def create_user(body: UserCreate, db: Session = Depends(get_db), admin: User = Depends(get_current_admin)):
+def create_user(body: UserCreate, background_tasks: BackgroundTasks, db: Session = Depends(get_db), admin: User = Depends(get_current_admin)):
     if db.query(User).filter(User.email == body.email).first():
         raise HTTPException(status_code=400, detail="Email already registered")
     temp_pw = generate_temp_password()
@@ -166,7 +168,7 @@ def create_user(body: UserCreate, db: Session = Depends(get_db), admin: User = D
     <p><strong>Email:</strong> {user.email}<br><strong>Temporary Password:</strong> {temp_pw}</p>
     <p><a href="{app_url}/login" style="background:#1B4F8A;color:#fff;padding:10px 20px;text-decoration:none;border-radius:5px">Login Now</a></p>
     <p>Please change your password after first login.</p>"""
-    send_email(user.email, "[FTI] Your Trading App Account", html)
+    background_tasks.add_task(send_email, user.email, "[FTI] Your Trading App Account", html)
     return {"id": user.id, "name": user.name, "email": user.email, "temp_password": temp_pw}
 
 @admin_router.put("/users/{user_id}")
@@ -178,6 +180,8 @@ def update_user(user_id: int, body: UserUpdate, db: Session = Depends(get_db), a
     if body.mobile is not None: user.mobile = body.mobile
     if body.investment_amount is not None: user.investment_amount = body.investment_amount
     if body.is_active is not None: user.is_active = body.is_active
+    if body.email is not None: user.email = body.email
+    if body.password is not None: user.hashed_password = hash_password(body.password)
     db.commit()
     return {"message": "User updated"}
 
