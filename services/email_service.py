@@ -3,6 +3,10 @@ import logging
 import urllib.request
 import urllib.error
 import json
+from typing import List, Dict
+from datetime import date
+from sqlalchemy.orm import Session
+from database import User, Signal, Position, BSEStock, EmailLog
 
 logger = logging.getLogger(__name__)
 

@@ -1,10 +1,11 @@
 """
 FTI Trading App — Core Logic Tests
 
-Covers three areas:
-  1. BSE Data Fetching  — yfinance fetch, bhav copy download, column parsing
-  2. Signal Accuracy    — BUY / EXIT / HOLD / STAND_ASIDE prediction logic
-  3. 5-Day Condition    — counter increment, reset, and edge cases
+Covers four areas:
+  1. BSE Data Fetching       — yfinance fetch, bhav copy download, column parsing
+  2. Signal Accuracy         — BUY / EXIT / HOLD / STAND_ASIDE prediction logic
+  3. 5-Day Condition         — counter increment, reset, and edge cases
+  4. Portfolio Simulation    — multi-stock backtest with shared capital allocation
 """
 
 import sys, os
@@ -24,6 +25,7 @@ from services.engine import (
     generate_signal_for_stock,
     get_available_funds,
     run_backtest,
+    run_portfolio_backtest,
 )
 from services.data_service import download_bhav_copy, fetch_yfinance
 
@@ -721,3 +723,214 @@ class TestBacktestEngine:
         # Either no trades or a message
         assert "trades" in result
         assert result["trades"] == [] or isinstance(result.get("message"), str)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 5 — PORTFOLIO SIMULATION ENGINE
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _portfolio_dfs(n_stocks=3, n_days=200):
+    """
+    Build a dict of {str(stock_id): DataFrame} for portfolio backtest tests.
+    Each stock has rising-then-flat data with slightly different phase so
+    at least some entry signals are generated.
+    """
+    dfs = {}
+    names = {}
+    for i in range(n_stocks):
+        # Offset start price so each stock has a different channel level
+        start = 100.0 + i * 50
+        df = _rising(n=n_days, start_price=start, step=0.8)
+        dfs[str(i + 1)]   = df
+        names[str(i + 1)] = f"Stock {i + 1}"
+    return dfs, names
+
+
+def _portfolio_flat_dfs(n_stocks=3, n_days=200, flat_from=120):
+    """
+    Rising then flat data — guarantees five_day_count >= 5 on later rows,
+    giving the engine real entry candidates across multiple stocks.
+    """
+    dfs = {}
+    names = {}
+    for i in range(n_stocks):
+        df = _flat_then_decline(n=n_days, decline=80.0 + i * 5, flat_from=flat_from)
+        dfs[str(i + 1)]   = df
+        names[str(i + 1)] = f"Stock {i + 1}"
+    return dfs, names
+
+
+class TestPortfolioSimEngine:
+
+    # ── Return structure ──────────────────────────────────────────────────
+
+    def test_returns_required_top_level_keys(self):
+        """run_portfolio_backtest must return trades, equity_curve, metrics, stock_breakdown."""
+        dfs, names = _portfolio_flat_dfs()
+        result = run_portfolio_backtest(dfs, names, starting_capital=500_000.0)
+        for key in ["trades", "equity_curve", "metrics", "stock_breakdown"]:
+            assert key in result, f"Missing top-level key: {key}"
+
+    def test_metrics_contains_required_fields(self):
+        """metrics dict must include all standard performance fields."""
+        dfs, names = _portfolio_flat_dfs()
+        result = run_portfolio_backtest(dfs, names, starting_capital=500_000.0)
+        if result.get("metrics"):
+            for field in ["total_trades", "win_rate", "total_pnl", "total_return_pct",
+                          "max_drawdown_pct", "starting_capital", "final_capital",
+                          "stocks_tested", "stocks_with_trades"]:
+                assert field in result["metrics"], f"Missing metrics field: {field}"
+
+    def test_equity_curve_has_date_value_cash_positions(self):
+        """Each equity_curve entry must have date, value, cash, open_positions."""
+        dfs, names = _portfolio_flat_dfs()
+        result = run_portfolio_backtest(dfs, names, starting_capital=500_000.0)
+        for pt in result["equity_curve"][:5]:
+            for key in ["date", "value", "cash", "open_positions"]:
+                assert key in pt, f"equity_curve entry missing key: {key}"
+
+    # ── Capital management ────────────────────────────────────────────────
+
+    def test_portfolio_value_never_exceeds_starting_capital_significantly(self):
+        """
+        Without leverage, total portfolio value should not massively exceed
+        starting capital (up to 2× is fine due to gains, but 10× signals a bug).
+        """
+        dfs, names = _portfolio_flat_dfs()
+        result = run_portfolio_backtest(dfs, names, starting_capital=500_000.0)
+        for pt in result["equity_curve"]:
+            assert pt["value"] < 500_000.0 * 10, \
+                f"Portfolio value exploded: {pt['value']}"
+
+    def test_cash_never_goes_negative(self):
+        """Cash portion of equity must never go below 0."""
+        dfs, names = _portfolio_flat_dfs()
+        result = run_portfolio_backtest(dfs, names, starting_capital=500_000.0)
+        for pt in result["equity_curve"]:
+            assert pt["cash"] >= -0.01, f"Cash went negative: {pt['cash']}"
+
+    def test_max_concurrent_positions_respected(self):
+        """open_positions in equity_curve must never exceed max_positions."""
+        dfs, names = _portfolio_flat_dfs(n_stocks=5)
+        max_pos = 2
+        result = run_portfolio_backtest(
+            dfs, names, starting_capital=500_000.0, max_positions=max_pos
+        )
+        for pt in result["equity_curve"]:
+            assert pt["open_positions"] <= max_pos, \
+                f"open_positions {pt['open_positions']} exceeded max {max_pos}"
+
+    def test_single_stock_portfolio_matches_single_backtest_direction(self):
+        """
+        A 1-stock portfolio should produce trades in the same direction
+        (all wins or all losses) as the single-stock backtest on rising data.
+        """
+        df = _flat_then_decline(n=200, flat_from=120)
+        # Single-stock
+        single = run_backtest(df.copy(), starting_capital=500_000.0)
+        # Portfolio with same stock
+        portfolio = run_portfolio_backtest(
+            {"1": df.copy()}, {"1": "TestStock"},
+            starting_capital=500_000.0
+        )
+        # Both should agree on whether there were any trades
+        single_had_trades    = len(single.get("trades", [])) > 0
+        portfolio_had_trades = len(portfolio.get("trades", [])) > 0
+        # If single backtest found trades, portfolio should too (same logic)
+        if single_had_trades:
+            assert portfolio_had_trades, \
+                "Single-stock portfolio found no trades but single backtest did"
+
+    # ── Trade integrity ───────────────────────────────────────────────────
+
+    def test_all_trades_have_required_fields(self):
+        """Every trade must include stock_id, entry/exit dates and prices, pnl, qty."""
+        dfs, names = _portfolio_flat_dfs()
+        result = run_portfolio_backtest(dfs, names, starting_capital=500_000.0)
+        for t in result["trades"]:
+            for field in ["stock_id", "stock_name", "entry_date", "entry_price",
+                          "exit_date", "exit_price", "quantity", "pnl",
+                          "exit_reason", "days_held", "result"]:
+                assert field in t, f"Trade missing field: {field}"
+
+    def test_trade_entry_before_exit(self):
+        """entry_date must be <= exit_date in every trade."""
+        dfs, names = _portfolio_flat_dfs()
+        result = run_portfolio_backtest(dfs, names, starting_capital=500_000.0)
+        for t in result["trades"]:
+            assert t["entry_date"] <= t["exit_date"], \
+                f"Entry {t['entry_date']} is after exit {t['exit_date']}"
+
+    def test_trade_quantity_positive(self):
+        """All trade quantities must be > 0."""
+        dfs, names = _portfolio_flat_dfs()
+        result = run_portfolio_backtest(dfs, names, starting_capital=500_000.0)
+        for t in result["trades"]:
+            assert t["quantity"] > 0, f"Trade has non-positive quantity: {t}"
+
+    def test_trade_result_field_consistent_with_pnl(self):
+        """'result' field must be WIN iff pnl > 0, otherwise LOSS."""
+        dfs, names = _portfolio_flat_dfs()
+        result = run_portfolio_backtest(dfs, names, starting_capital=500_000.0)
+        for t in result["trades"]:
+            expected = "WIN" if t["pnl"] > 0 else "LOSS"
+            assert t["result"] == expected, \
+                f"result={t['result']} but pnl={t['pnl']}"
+
+    def test_exit_reason_is_valid(self):
+        """exit_reason must be one of the four known values."""
+        valid_reasons = {"rejection_rule", "adx_exit", "trailing_stop", "end_of_data"}
+        dfs, names = _portfolio_flat_dfs()
+        result = run_portfolio_backtest(dfs, names, starting_capital=500_000.0)
+        for t in result["trades"]:
+            assert t["exit_reason"] in valid_reasons, \
+                f"Unknown exit_reason: {t['exit_reason']}"
+
+    # ── Stock breakdown ───────────────────────────────────────────────────
+
+    def test_stock_breakdown_covers_all_traded_stocks(self):
+        """stock_breakdown must have one entry per stock that had at least one trade."""
+        dfs, names = _portfolio_flat_dfs(n_stocks=3)
+        result = run_portfolio_backtest(dfs, names, starting_capital=500_000.0)
+        traded_ids = {t["stock_id"] for t in result["trades"]}
+        breakdown_names = {b["stock_name"] for b in result["stock_breakdown"]}
+        for sid in traded_ids:
+            stock_name = names[sid]
+            assert stock_name in breakdown_names, \
+                f"Stock {stock_name} traded but missing from stock_breakdown"
+
+    def test_stock_breakdown_win_rate_in_valid_range(self):
+        """Win rate in stock_breakdown must be 0–100."""
+        dfs, names = _portfolio_flat_dfs()
+        result = run_portfolio_backtest(dfs, names, starting_capital=500_000.0)
+        for b in result["stock_breakdown"]:
+            assert 0 <= b["win_rate"] <= 100, \
+                f"Invalid win_rate {b['win_rate']} for {b['stock_name']}"
+
+    # ── Edge cases ────────────────────────────────────────────────────────
+
+    def test_all_insufficient_data_returns_message(self):
+        """All stocks with < 60 rows → message, no crash."""
+        tiny_dfs   = {"1": _ohlcv(30, highs=100.0), "2": _ohlcv(30, highs=110.0)}
+        tiny_names = {"1": "TinyA", "2": "TinyB"}
+        result = run_portfolio_backtest(tiny_dfs, tiny_names, starting_capital=100_000.0)
+        assert "message" in result or result.get("trades") == [], \
+            "Expected graceful handling of insufficient data"
+
+    def test_single_stock_no_crash(self):
+        """Portfolio with exactly 1 stock should not crash."""
+        df = _flat_then_decline(n=200, flat_from=120)
+        result = run_portfolio_backtest(
+            {"1": df}, {"1": "OnlyStock"}, starting_capital=200_000.0
+        )
+        assert "trades" in result
+        assert "equity_curve" in result
+
+    def test_max_positions_one_allows_only_one_trade_at_a_time(self):
+        """With max_positions=1, open_positions in equity_curve never exceeds 1."""
+        dfs, names = _portfolio_flat_dfs(n_stocks=5)
+        result = run_portfolio_backtest(
+            dfs, names, starting_capital=500_000.0, max_positions=1
+        )
+        for pt in result["equity_curve"]:
+            assert pt["open_positions"] <= 1

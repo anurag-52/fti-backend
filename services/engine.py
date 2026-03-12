@@ -469,3 +469,283 @@ def run_backtest(
             "final_capital":    round(starting_capital + total_pnl, 2),
         }
     }
+
+
+# ─── PORTFOLIO SIMULATION ENGINE ─────────────────────────────────────────────
+
+def run_portfolio_backtest(
+    stock_dfs: Dict[str, pd.DataFrame],
+    stock_names: Dict[str, str],
+    starting_capital: float,
+    risk_pct: float = 0.01,
+    max_positions: int = 10,
+) -> Dict:
+    """
+    Multi-stock portfolio backtest with shared capital allocation.
+
+    Algorithm (per day):
+      1. Process exits for all open positions (freeing capital).
+      2. Find new entry candidates: five_day_count >= 5, adx_rising,
+         buy stop price triggered today.
+      3. Rank candidates by five_day_count desc (most mature first),
+         then ADX desc as tiebreak.
+      4. Allocate capital to candidates until max_positions reached
+         or capital exhausted.
+
+    Args:
+        stock_dfs:         {str(stock_id): OHLCV DataFrame}
+        stock_names:       {str(stock_id): company_name}
+        starting_capital:  total INR to simulate with
+        risk_pct:          fraction of starting_capital risked per trade (default 1%)
+        max_positions:     max concurrent open positions (default 10)
+
+    Returns dict with: trades, equity_curve, metrics, stock_breakdown
+    """
+    # Pre-compute channels; skip stocks with < 60 rows
+    computed: Dict[str, pd.DataFrame] = {}
+    for sid, df in stock_dfs.items():
+        if len(df) < 60:
+            logger.warning(f"Skipping stock {sid}: only {len(df)} rows")
+            continue
+        c = calculate_channels(df.copy())
+        c = c.dropna(subset=["ch55_high", "adx"]).reset_index(drop=True)
+        if len(c) > 0:
+            computed[sid] = c
+
+    if not computed:
+        return {
+            "trades": [], "equity_curve": [], "metrics": {},
+            "message": "No stocks have sufficient data (need >= 60 rows each)",
+        }
+
+    # Build {date → row_index} lookup per stock for O(1) daily access
+    date_idx: Dict[str, Dict] = {}
+    for sid, df in computed.items():
+        date_idx[sid] = {row["date"]: i for i, row in df.iterrows()}
+
+    all_dates = sorted(set(d for di in date_idx.values() for d in di))
+
+    capital   = starting_capital
+    positions: Dict[str, Dict] = {}   # sid → {entry_price, qty, entry_date, stop_loss}
+    trades:    List[Dict]       = []
+    equity_curve: List[Dict]    = []
+
+    today_rows: Dict[str, any] = {}   # kept for end-of-data close
+
+    for today in all_dates:
+        today_rows = {}
+        prev_rows  = {}
+        for sid, df in computed.items():
+            if today in date_idx[sid]:
+                idx = date_idx[sid][today]
+                today_rows[sid] = df.iloc[idx]
+                if idx > 0:
+                    prev_rows[sid] = df.iloc[idx - 1]
+
+        # ── Step 1: Process exits ────────────────────────────────────────────
+        for sid in list(positions.keys()):
+            if sid not in today_rows:
+                continue
+            row  = today_rows[sid]
+            prev = prev_rows.get(sid)
+            pos  = positions[sid]
+
+            ch55        = row.get("ch55_high")
+            ch20        = row.get("ch20_low")
+            adx_rising  = bool(row.get("adx_rising", False))
+            today_close = float(row["close"])
+            today_low   = float(row["low"])
+
+            if pd.isna(ch55):
+                continue
+
+            exit_reason = None
+            exit_price  = today_close
+
+            # 1. Rejection rule
+            if today_close < float(ch55):
+                exit_reason = "rejection_rule"
+            # 2. ADX exit
+            elif prev is not None:
+                prev_adx = float(prev.get("adx", 0) or 0)
+                if prev_adx >= 40 and not adx_rising:
+                    exit_reason = "adx_exit"
+            # 3. Trailing stop
+            if not exit_reason and not pd.isna(ch20) and today_low <= float(ch20):
+                exit_reason = "trailing_stop"
+                exit_price  = float(ch20)
+
+            if exit_reason:
+                pnl = (exit_price - pos["entry_price"]) * pos["qty"]
+                capital += pos["entry_price"] * pos["qty"] + pnl
+                entry_date = pos["entry_date"]
+                days_held  = (today - entry_date).days if isinstance(today, date) and isinstance(entry_date, date) else 0
+                trades.append({
+                    "stock_id":    sid,
+                    "stock_name":  stock_names.get(sid, sid),
+                    "entry_date":  str(entry_date),
+                    "entry_price": pos["entry_price"],
+                    "exit_date":   str(today),
+                    "exit_price":  round(exit_price, 2),
+                    "quantity":    pos["qty"],
+                    "pnl":         round(pnl, 2),
+                    "exit_reason": exit_reason,
+                    "days_held":   days_held,
+                    "result":      "WIN" if pnl > 0 else "LOSS",
+                })
+                del positions[sid]
+
+        # ── Step 2: Find entry candidates ────────────────────────────────────
+        entry_candidates = []
+        for sid, row in today_rows.items():
+            if sid in positions:
+                continue
+            prev = prev_rows.get(sid)
+            if prev is None:
+                continue
+
+            five_count = int(row.get("five_day_count", 0) or 0)
+            adx_rising = bool(row.get("adx_rising", False))
+            ch55_prev  = prev.get("ch55_high")
+
+            if pd.isna(ch55_prev) or five_count < 5 or not adx_rising:
+                continue
+
+            buy_stop   = round(float(ch55_prev) * 1.0025, 2)
+            today_high = float(row["high"])
+
+            if today_high < buy_stop:
+                continue  # buy stop not triggered
+
+            stop_loss = float(row["low"])
+            if stop_loss >= buy_stop:
+                stop_loss = round(buy_stop * 0.98, 2)
+
+            entry_candidates.append({
+                "sid":        sid,
+                "buy_stop":   buy_stop,
+                "stop_loss":  stop_loss,
+                "five_count": five_count,
+                "adx":        float(row.get("adx", 0) or 0),
+            })
+
+        # Most-mature 5-day condition first; ADX as tiebreak
+        entry_candidates.sort(key=lambda x: (x["five_count"], x["adx"]), reverse=True)
+
+        # ── Step 3: Allocate capital ─────────────────────────────────────────
+        for cand in entry_candidates:
+            if len(positions) >= max_positions:
+                break
+            qty, cap, _ = calculate_position_size(
+                starting_capital, cand["buy_stop"], cand["stop_loss"], capital, risk_pct
+            )
+            if qty <= 0 or cap > capital:
+                continue
+            capital -= cap
+            positions[cand["sid"]] = {
+                "entry_price": cand["buy_stop"],
+                "qty":         qty,
+                "entry_date":  today,
+                "stop_loss":   cand["stop_loss"],
+            }
+
+        # ── Equity snapshot ──────────────────────────────────────────────────
+        pos_value = sum(
+            float(today_rows[sid]["close"]) * pos["qty"]
+            for sid, pos in positions.items()
+            if sid in today_rows
+        )
+        equity_curve.append({
+            "date":            str(today),
+            "value":           round(capital + pos_value, 2),
+            "cash":            round(capital, 2),
+            "open_positions":  len(positions),
+        })
+
+    # Close any positions still open at last bar
+    last_date = all_dates[-1] if all_dates else None
+    for sid, pos in list(positions.items()):
+        if sid in today_rows:
+            exit_price = float(today_rows[sid]["close"])
+            pnl        = (exit_price - pos["entry_price"]) * pos["qty"]
+            entry_date = pos["entry_date"]
+            days_held  = (last_date - entry_date).days if last_date and isinstance(entry_date, date) else 0
+            trades.append({
+                "stock_id":    sid,
+                "stock_name":  stock_names.get(sid, sid),
+                "entry_date":  str(entry_date),
+                "entry_price": pos["entry_price"],
+                "exit_date":   str(last_date),
+                "exit_price":  round(exit_price, 2),
+                "quantity":    pos["qty"],
+                "pnl":         round(pnl, 2),
+                "exit_reason": "end_of_data",
+                "days_held":   days_held,
+                "result":      "WIN" if pnl > 0 else "LOSS",
+            })
+
+    # ── Aggregate metrics ────────────────────────────────────────────────────
+    if not trades:
+        return {
+            "trades": [], "equity_curve": equity_curve,
+            "metrics": {}, "stock_breakdown": [],
+            "message": "No trades generated in selected date range",
+        }
+
+    pnls      = [t["pnl"] for t in trades]
+    wins      = [p for p in pnls if p > 0]
+    losses    = [p for p in pnls if p <= 0]
+    total_pnl = sum(pnls)
+    win_rate  = len(wins) / len(trades) * 100
+    avg_win   = sum(wins)   / len(wins)   if wins   else 0
+    avg_loss  = sum(losses) / len(losses) if losses else 0
+
+    peak   = starting_capital
+    max_dd = 0.0
+    for pt in equity_curve:
+        val = pt["value"]
+        if val > peak:
+            peak = val
+        dd = (peak - val) / peak * 100 if peak > 0 else 0
+        if dd > max_dd:
+            max_dd = dd
+
+    # Per-stock breakdown
+    stock_agg: Dict[str, Dict] = {}
+    for t in trades:
+        sid = t["stock_id"]
+        if sid not in stock_agg:
+            stock_agg[sid] = {"name": t["stock_name"], "trades": 0, "pnl": 0.0, "wins": 0}
+        stock_agg[sid]["trades"] += 1
+        stock_agg[sid]["pnl"]    += t["pnl"]
+        if t["pnl"] > 0:
+            stock_agg[sid]["wins"] += 1
+
+    stock_breakdown = sorted([
+        {
+            "stock_name": v["name"],
+            "trades":     v["trades"],
+            "total_pnl":  round(v["pnl"], 2),
+            "win_rate":   round(v["wins"] / v["trades"] * 100, 1) if v["trades"] > 0 else 0,
+        }
+        for v in stock_agg.values()
+    ], key=lambda x: x["total_pnl"], reverse=True)
+
+    return {
+        "trades":          trades,
+        "equity_curve":    equity_curve,
+        "stock_breakdown": stock_breakdown,
+        "metrics": {
+            "total_trades":       len(trades),
+            "win_rate":           round(win_rate, 1),
+            "total_pnl":          round(total_pnl, 2),
+            "total_return_pct":   round(total_pnl / starting_capital * 100, 2),
+            "max_drawdown_pct":   round(max_dd, 2),
+            "avg_win":            round(avg_win, 2),
+            "avg_loss":           round(avg_loss, 2),
+            "starting_capital":   starting_capital,
+            "final_capital":      round(starting_capital + total_pnl, 2),
+            "stocks_tested":      len(computed),
+            "stocks_with_trades": len(stock_agg),
+        },
+    }

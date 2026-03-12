@@ -72,6 +72,14 @@ class BacktestRequest(BaseModel):
     starting_capital: Optional[float] = None
     risk_pct: float = 0.01
 
+class PortfolioSimRequest(BaseModel):
+    stock_ids: List[int]                  # 1–20 BSEStock IDs
+    start_date: date
+    end_date: date
+    starting_capital: Optional[float] = None
+    risk_pct: float = 0.01
+    max_concurrent_positions: int = 10    # cap on simultaneous open positions
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # AUTH ROUTER
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -523,6 +531,89 @@ def run_backtest_api(body: BacktestRequest, current_user: User = Depends(get_cur
     result["stock"] = {"name": stock.company_name, "bse_code": stock.bse_code}
     result["params"] = {"start_date": str(body.start_date), "end_date": str(body.end_date),
                         "starting_capital": capital, "risk_pct": body.risk_pct}
+    return result
+
+@backtest_router.post("/portfolio")
+def run_portfolio_sim(
+    body: PortfolioSimRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Portfolio Simulation Engine — multi-stock backtest with shared capital.
+
+    Selects up to 20 stocks, runs the Channel Breakout strategy across all of
+    them simultaneously, allocating capital from a single pool.  Entries are
+    prioritised by five_day_count (most mature first); max_concurrent_positions
+    caps how many stocks can be held at once.
+    """
+    if len(body.stock_ids) < 1:
+        raise HTTPException(status_code=400, detail="At least 1 stock is required")
+    if len(body.stock_ids) > 20:
+        raise HTTPException(status_code=400, detail="Maximum 20 stocks allowed")
+    if body.max_concurrent_positions < 1 or body.max_concurrent_positions > 20:
+        raise HTTPException(status_code=400, detail="max_concurrent_positions must be 1–20")
+
+    from services.data_service import fetch_yfinance
+    from services.engine import run_portfolio_backtest
+
+    stock_dfs:   dict = {}
+    stock_names: dict = {}
+    skipped:     list = []
+
+    for stock_id in body.stock_ids:
+        stock = db.query(BSEStock).filter(BSEStock.id == stock_id).first()
+        if not stock:
+            skipped.append({"stock_id": stock_id, "reason": "not found"})
+            continue
+
+        rows = db.query(OHLCV).filter(
+            OHLCV.stock_id == stock_id,
+            OHLCV.date     >= body.start_date,
+            OHLCV.date     <= body.end_date,
+        ).order_by(OHLCV.date).all()
+
+        if len(rows) >= 60:
+            df = pd.DataFrame([{
+                "date": r.date, "open": r.open, "high": r.high,
+                "low": r.low, "close": r.close, "volume": r.volume,
+            } for r in rows])
+        else:
+            df = fetch_yfinance(stock.symbol, body.start_date, body.end_date)
+            if df is None or len(df) < 60:
+                skipped.append({"stock_id": stock_id, "symbol": stock.symbol,
+                                 "reason": f"insufficient data ({len(rows)} rows in DB)"})
+                continue
+
+        sid = str(stock_id)
+        stock_dfs[sid]   = df
+        stock_names[sid] = stock.company_name
+
+    if not stock_dfs:
+        raise HTTPException(
+            status_code=400,
+            detail="No stocks had sufficient data. Need >= 60 trading days in the date range."
+        )
+
+    capital = body.starting_capital or current_user.investment_amount
+    result  = run_portfolio_backtest(
+        stock_dfs   = stock_dfs,
+        stock_names = stock_names,
+        starting_capital = capital,
+        risk_pct    = body.risk_pct,
+        max_positions = body.max_concurrent_positions,
+    )
+
+    result["params"] = {
+        "stocks_requested":        len(body.stock_ids),
+        "stocks_with_data":        len(stock_dfs),
+        "stocks_skipped":          skipped,
+        "start_date":              str(body.start_date),
+        "end_date":                str(body.end_date),
+        "starting_capital":        capital,
+        "risk_pct":                body.risk_pct,
+        "max_concurrent_positions": body.max_concurrent_positions,
+    }
     return result
 
 # ═══════════════════════════════════════════════════════════════════════════════
